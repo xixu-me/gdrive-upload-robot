@@ -15,66 +15,125 @@ export default {
 async function handleDocument(message, env) {
 	const fileId = message.document.file_id;
 	const fileName = message.document.file_name;
-	await uploadToDrive(fileId, fileName, env);
+	const fileSize = message.document.file_size; // Get file size
+	await uploadToDrive(fileId, fileName, fileSize, env);
 }
 
 async function handlePhoto(message, env) {
 	const photo = message.photo[message.photo.length - 1]; // Get the highest resolution photo
 	const fileId = photo.file_id;
+	const fileSize = photo.file_size; // Get file size
 	const fileName = `${fileId}.jpg`;
-	await uploadToDrive(fileId, fileName, env);
+	await uploadToDrive(fileId, fileName, fileSize, env);
 }
 
-async function uploadToDrive(fileId, fileName, env) {
+async function uploadToDrive(fileId, fileName, fileSize, env) {
 	const botToken = env.TELEGRAM_BOT_TOKEN;
 	const driveFolderId = env.GOOGLE_DRIVE_FOLDER_ID;
 	const adminChatId = env.ADMIN_CHAT_ID;
 	const googleCredentials = JSON.parse(env.GOOGLE_CREDENTIALS);
 
-	// Get file path from Telegram
-	const fileDetailsUrl = `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`;
-	const fileDetailsResponse = await fetch(fileDetailsUrl);
-	const fileDetails = await fileDetailsResponse.json();
-	if (!fileDetails.ok) {
-		await sendMessage(adminChatId, `Error getting file details: ${fileDetails.description}`, botToken);
-		return;
-	}
-	const filePath = fileDetails.result.file_path;
-	const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+	// Define the threshold for large files (20MB)
+	const RESUMABLE_UPLOAD_THRESHOLD = 20 * 1024 * 1024;
 
-	// Download file from Telegram
-	const fileResponse = await fetch(fileUrl);
-	const fileData = await fileResponse.arrayBuffer();
+	try {
+		// Get file details from Telegram
+		const fileDetailsUrl = `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`;
+		const fileDetailsResponse = await fetch(fileDetailsUrl);
+		const fileDetails = await fileDetailsResponse.json();
+		if (!fileDetails.ok) {
+			throw new Error(`Failed to get file details: ${fileDetails.description}`);
+		}
+		const filePath = fileDetails.result.file_path;
+		const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
 
-	// Authenticate with Google Drive
-	const jwtToken = await getGoogleAuthToken(googleCredentials);
+		// Get Google Drive authentication token
+		const jwtToken = await getGoogleAuthToken(googleCredentials);
 
-	// Upload file to Google Drive
-	const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-	const metadata = {
-		name: fileName,
-		parents: [driveFolderId],
-	};
+		// Download file from Telegram
+		const fileResponse = await fetch(fileUrl);
+		if (!fileResponse.ok) {
+			throw new Error(`Failed to download file from Telegram: ${fileResponse.statusText}`);
+		}
 
-	const formData = new FormData();
-	formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-	formData.append('file', new Blob([fileData]));
+		const metadata = {
+			name: fileName,
+			parents: [driveFolderId],
+		};
 
-	const uploadResponse = await fetch(uploadUrl, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${jwtToken}`,
-		},
-		body: formData,
-	});
+		// Choose upload method based on file size
+		if (fileSize && fileSize > RESUMABLE_UPLOAD_THRESHOLD) {
+			// --- Resumable Upload for large files ---
+			await sendMessage(
+				adminChatId,
+				`File "${fileName}" (${(fileSize / 1024 / 1024).toFixed(2)} MB) is large, starting resumable upload...`,
+				botToken
+			);
 
-	const uploadResult = await uploadResponse.json();
-	if (uploadResult.id) {
-		await sendMessage(adminChatId, `File "${fileName}" uploaded to Google Drive successfully!`, botToken);
-	} else {
-		await sendMessage(adminChatId, `Error uploading file: ${JSON.stringify(uploadResult.error)}`, botToken);
+			// 1. Create a resumable session to get the upload URL
+			const initiateResponse = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${jwtToken}`,
+					'Content-Type': 'application/json; charset=UTF-8',
+				},
+				body: JSON.stringify(metadata),
+			});
+
+			if (!initiateResponse.ok) {
+				throw new Error(`Failed to create resumable session: ${await initiateResponse.text()}`);
+			}
+
+			const location = initiateResponse.headers.get('Location'); // Get the unique URL for the upload
+
+			// 2. Upload the file content
+			const uploadResponse = await fetch(location, {
+				method: 'PUT',
+				headers: {
+					'Content-Length': fileResponse.headers.get('content-length'),
+				},
+				body: fileResponse.body, // Stream the body directly for better efficiency
+			});
+
+			const uploadResult = await uploadResponse.json();
+			if (uploadResult.id) {
+				await sendMessage(
+					adminChatId,
+					`File "${fileName}" has been successfully uploaded to Google Drive using resumable upload!`,
+					botToken
+				);
+			} else {
+				throw new Error(`Resumable upload failed: ${JSON.stringify(uploadResult.error)}`);
+			}
+		} else {
+			// --- Simple Multipart Upload for smaller files ---
+			const fileData = await fileResponse.arrayBuffer();
+			const formData = new FormData();
+			formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+			formData.append('file', new Blob([fileData]));
+
+			const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+			const uploadResponse = await fetch(uploadUrl, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${jwtToken}`,
+				},
+				body: formData,
+			});
+
+			const uploadResult = await uploadResponse.json();
+			if (uploadResult.id) {
+				await sendMessage(adminChatId, `File "${fileName}" has been successfully uploaded to Google Drive!`, botToken);
+			} else {
+				throw new Error(`Failed to upload file: ${JSON.stringify(uploadResult.error)}`);
+			}
+		}
+	} catch (error) {
+		await sendMessage(adminChatId, `An error occurred: ${error.message}`, botToken);
 	}
 }
+
+// --- Helper Functions ---
 
 async function getGoogleAuthToken(credentials) {
 	const header = { alg: 'RS256', typ: 'JWT' };
