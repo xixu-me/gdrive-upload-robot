@@ -15,17 +15,19 @@ export default {
 async function handleDocument(message, env) {
 	const fileId = message.document.file_id;
 	const fileName = message.document.file_name;
-	await uploadToDrive(fileId, fileName, env);
+	const fileSize = message.document.file_size;
+	await uploadToDrive(fileId, fileName, fileSize, env);
 }
 
 async function handlePhoto(message, env) {
 	const photo = message.photo[message.photo.length - 1]; // Get the highest resolution photo
 	const fileId = photo.file_id;
 	const fileName = `${fileId}.jpg`;
-	await uploadToDrive(fileId, fileName, env);
+	const fileSize = photo.file_size;
+	await uploadToDrive(fileId, fileName, fileSize, env);
 }
 
-async function uploadToDrive(fileId, fileName, env) {
+async function uploadToDrive(fileId, fileName, fileSize, env) {
 	const botToken = env.TELEGRAM_BOT_TOKEN;
 	const driveFolderId = env.GOOGLE_DRIVE_FOLDER_ID;
 	const adminChatId = env.ADMIN_CHAT_ID;
@@ -42,27 +44,20 @@ async function uploadToDrive(fileId, fileName, env) {
 	const filePath = fileDetails.result.file_path;
 	const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
 
-	// Download file from Telegram
-	const fileResponse = await fetch(fileUrl);
-	const fileData = await fileResponse.arrayBuffer();
-	const fileSize = fileData.byteLength;
-
 	// Authenticate with Google Drive
 	const jwtToken = await getGoogleAuthToken(googleCredentials);
 
-	// Check if file is larger than 20MB (20 * 1024 * 1024 = 20971520 bytes)
-	const MAX_SIMPLE_UPLOAD_SIZE = 20971520;
-
-	if (fileSize > MAX_SIMPLE_UPLOAD_SIZE) {
-		await sendMessage(adminChatId, `File "${fileName}" is ${Math.round(fileSize / 1024 / 1024)}MB, using resumable upload...`, botToken);
-		await uploadLargeFile(fileData, fileName, driveFolderId, jwtToken, adminChatId, botToken);
-	} else {
-		await uploadSmallFile(fileData, fileName, driveFolderId, jwtToken, adminChatId, botToken);
+	// For files larger than 20MB, use resumable upload
+	if (fileSize > 20 * 1024 * 1024) {
+		await resumableUpload(fileUrl, fileName, driveFolderId, jwtToken, adminChatId, botToken);
+		return;
 	}
-}
 
-async function uploadSmallFile(fileData, fileName, driveFolderId, jwtToken, adminChatId, botToken) {
-	// Upload file to Google Drive using multipart upload
+	// Download file from Telegram
+	const fileResponse = await fetch(fileUrl);
+	const fileData = await fileResponse.arrayBuffer();
+
+	// Upload file to Google Drive using multipart upload for smaller files
 	const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
 	const metadata = {
 		name: fileName,
@@ -89,160 +84,64 @@ async function uploadSmallFile(fileData, fileName, driveFolderId, jwtToken, admi
 	}
 }
 
-async function uploadLargeFile(fileData, fileName, driveFolderId, jwtToken, adminChatId, botToken) {
+async function resumableUpload(fileUrl, fileName, driveFolderId, jwtToken, adminChatId, botToken) {
 	const metadata = {
 		name: fileName,
 		parents: [driveFolderId],
 	};
 
-	// Step 1: Initiate resumable upload
-	const initiateUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable';
-	const initiateResponse = await fetch(initiateUrl, {
+	const initiationResponse = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
 		method: 'POST',
 		headers: {
 			Authorization: `Bearer ${jwtToken}`,
 			'Content-Type': 'application/json',
-			'X-Upload-Content-Type': 'application/octet-stream',
-			'X-Upload-Content-Length': fileData.byteLength.toString(),
 		},
 		body: JSON.stringify(metadata),
 	});
 
-	if (!initiateResponse.ok) {
-		const error = await initiateResponse.text();
-		await sendMessage(adminChatId, `Error initiating resumable upload: ${error}`, botToken);
+	if (!initiationResponse.ok) {
+		await sendMessage(adminChatId, `Error initiating resumable upload: ${await initiationResponse.text()}`, botToken);
 		return;
 	}
 
-	const resumableUploadUrl = initiateResponse.headers.get('Location');
-	if (!resumableUploadUrl) {
-		await sendMessage(adminChatId, `Error: No resumable upload URL received`, botToken);
-		return;
-	}
+	const location = initiationResponse.headers.get('Location');
 
-	// Step 2: Check if any bytes have already been uploaded
-	let uploadedBytes = await getUploadStatus(resumableUploadUrl, jwtToken);
-	if (uploadedBytes > 0) {
-		await sendMessage(adminChatId, `Resuming upload from ${Math.round(uploadedBytes / 1024 / 1024)}MB`, botToken);
-	}
+	const fileResponse = await fetch(fileUrl);
+	const reader = fileResponse.body.getReader();
+	let uploaded = 0;
+	const chunkSize = 256 * 1024 * 10; // 2.56MB chunks
+	const totalSize = Number(fileResponse.headers.get('Content-Length'));
 
-	// Step 3: Upload file in chunks
-	const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
-	const MAX_RETRIES = 3;
-	const totalSize = fileData.byteLength;
-
-	while (uploadedBytes < totalSize) {
-		const start = uploadedBytes;
-		const end = Math.min(start + CHUNK_SIZE, totalSize);
-		const chunk = fileData.slice(start, end);
-		const chunkSize = end - start;
-
-		let retryCount = 0;
-		let success = false;
-
-		while (retryCount < MAX_RETRIES && !success) {
-			try {
-				const chunkResponse = await fetch(resumableUploadUrl, {
-					method: 'PUT',
-					headers: {
-						Authorization: `Bearer ${jwtToken}`,
-						'Content-Range': `bytes ${start}-${end - 1}/${totalSize}`,
-						'Content-Length': chunkSize.toString(),
-					},
-					body: chunk,
-				});
-
-				if (chunkResponse.status === 308) {
-					// Chunk uploaded successfully, continue with next chunk
-					const rangeHeader = chunkResponse.headers.get('Range');
-					if (rangeHeader) {
-						const rangeMatch = rangeHeader.match(/bytes=0-(\d+)/);
-						if (rangeMatch) {
-							uploadedBytes = parseInt(rangeMatch[1]) + 1;
-						} else {
-							uploadedBytes = end;
-						}
-					} else {
-						uploadedBytes = end;
-					}
-
-					// Send progress update (only every 20% to avoid spam)
-					const progress = Math.round((uploadedBytes / totalSize) * 100);
-					if (progress % 20 === 0 || uploadedBytes === end) {
-						await sendMessage(
-							adminChatId,
-							`Upload progress: ${progress}% (${Math.round(uploadedBytes / 1024 / 1024)}MB / ${Math.round(totalSize / 1024 / 1024)}MB)`,
-							botToken
-						);
-					}
-					success = true;
-				} else if (chunkResponse.status === 200 || chunkResponse.status === 201) {
-					// Upload completed
-					const uploadResult = await chunkResponse.json();
-					if (uploadResult.id) {
-						await sendMessage(adminChatId, `File "${fileName}" uploaded to Google Drive successfully!`, botToken);
-					} else {
-						await sendMessage(adminChatId, `Error completing upload: ${JSON.stringify(uploadResult)}`, botToken);
-					}
-					return;
-				} else if (chunkResponse.status === 404) {
-					// Session expired, need to restart
-					await sendMessage(adminChatId, `Upload session expired. Please try uploading the file again.`, botToken);
-					return;
-				} else if (chunkResponse.status >= 500) {
-					// Server error, retry
-					retryCount++;
-					if (retryCount < MAX_RETRIES) {
-						await new Promise((resolve) => setTimeout(resolve, 1000 * retryCount)); // Exponential backoff
-						await sendMessage(adminChatId, `Server error, retrying chunk upload... (${retryCount}/${MAX_RETRIES})`, botToken);
-					}
-				} else {
-					// Other error, don't retry
-					const error = await chunkResponse.text();
-					await sendMessage(adminChatId, `Error uploading chunk: ${error}`, botToken);
-					return;
-				}
-			} catch (error) {
-				retryCount++;
-				if (retryCount < MAX_RETRIES) {
-					await new Promise((resolve) => setTimeout(resolve, 1000 * retryCount)); // Exponential backoff
-					await sendMessage(adminChatId, `Network error, retrying chunk upload... (${retryCount}/${MAX_RETRIES})`, botToken);
-				} else {
-					await sendMessage(adminChatId, `Network error uploading chunk after ${MAX_RETRIES} retries: ${error.message}`, botToken);
-					return;
-				}
-			}
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) {
+			break;
 		}
 
-		if (!success) {
-			await sendMessage(adminChatId, `Failed to upload chunk after ${MAX_RETRIES} retries`, botToken);
-			return;
-		}
-	}
-}
-
-async function getUploadStatus(resumableUploadUrl, jwtToken) {
-	try {
-		const statusResponse = await fetch(resumableUploadUrl, {
+		const chunk = value;
+		const uploadResponse = await fetch(location, {
 			method: 'PUT',
 			headers: {
-				Authorization: `Bearer ${jwtToken}`,
-				'Content-Range': 'bytes */*',
+				'Content-Range': `bytes ${uploaded}-${uploaded + chunk.length - 1}/${totalSize}`,
 			},
+			body: chunk,
 		});
 
-		if (statusResponse.status === 308) {
-			const rangeHeader = statusResponse.headers.get('Range');
-			if (rangeHeader) {
-				const rangeMatch = rangeHeader.match(/bytes=0-(\d+)/);
-				if (rangeMatch) {
-					return parseInt(rangeMatch[1]) + 1;
-				}
+		if (uploadResponse.status === 308) {
+			// Resume Incomplete
+			uploaded += chunk.length;
+		} else if (uploadResponse.ok) {
+			const uploadResult = await uploadResponse.json();
+			if (uploadResult.id) {
+				await sendMessage(adminChatId, `File "${fileName}" uploaded to Google Drive successfully!`, botToken);
+			} else {
+				await sendMessage(adminChatId, `Error completing resumable upload: ${JSON.stringify(uploadResult.error)}`, botToken);
 			}
+			return;
+		} else {
+			await sendMessage(adminChatId, `Error during resumable upload chunk: ${await uploadResponse.text()}`, botToken);
+			return;
 		}
-		return 0;
-	} catch (error) {
-		return 0;
 	}
 }
 
