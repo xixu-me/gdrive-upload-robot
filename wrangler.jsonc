@@ -5,9 +5,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"compatibility_date": "2025-07-03",
-	"limits": {
-		"cpu_ms": 10000
-	},
 	"main": "src/index.js",
 	"name": "gdrive-upload-robot",
 	"observability": {
