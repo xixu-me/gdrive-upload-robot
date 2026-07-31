@@ -2,9 +2,9 @@
 	"author": "Xi Xu",
 	"description": "A Telegram bot built on Cloudflare Workers that automatically uploads files and photos sent to it directly to Google Drive",
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.13.1",
+		"@cloudflare/vitest-pool-workers": "^0.20.1",
 		"vitest": "^4.1.0",
-		"wrangler": "^4.74.0"
+		"wrangler": "^4.118.0"
 	},
 	"homepage": "https://github.com/xixu-me/gdrive-upload-robot",
 	"keywords": [
