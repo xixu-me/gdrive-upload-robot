@@ -4,7 +4,7 @@
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.20.1",
 		"vitest": "^5.0.3",
-		"wrangler": "^4.118.0"
+		"wrangler": "^4.147.0"
 	},
 	"homepage": "https://github.com/xixu-me/gdrive-upload-robot",
 	"keywords": [
