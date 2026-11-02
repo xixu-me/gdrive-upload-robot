@@ -3,7 +3,7 @@
 	"description": "A Telegram bot built on Cloudflare Workers that automatically uploads files and photos sent to it directly to Google Drive",
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.23.0",
-		"vitest": "^5.0.5",
+		"vitest": "^4.1.12",
 		"wrangler": "^4.156.0"
 	},
 	"homepage": "https://github.com/xixu-me/gdrive-upload-robot",
@@ -20,10 +20,11 @@
 	"main": "src/index.js",
 	"name": "gdrive-upload-robot",
 	"overrides": {
-		"undici": "^7.29.1",
+		"undici": "^7.30.1",
 		"esbuild": "0.28.1",
 		"postcss": "8.5.23",
-		"sharp": "^0.35.4"
+		"sharp": "^0.35.4",
+		"zod": "^4.6.7"
 	},
 	"private": false,
 	"repository": {
